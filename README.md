@@ -4,4 +4,4 @@ A simple unreal engine 5 plugin to provide programmer-facing scripting support i
 
 
 ## Usage 
-See LuaScriptingAPi.md for reference
+See the [API Documentation](LuaScriptingAPI.md) for reference
