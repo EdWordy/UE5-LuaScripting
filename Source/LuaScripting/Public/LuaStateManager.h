@@ -6,6 +6,9 @@
 // Forward declarations for Lua
 struct lua_State;
 
+// Define a proper logging category
+DECLARE_LOG_CATEGORY_EXTERN(LogLuaScripting, Log, All);
+
 /**
  * Manager class for Lua states in Unreal Engine
  * Handles creation, management, and destruction of Lua states
@@ -13,6 +16,10 @@ struct lua_State;
 class LUASCRIPTING_API FLuaStateManager
 {
 public:
+    // Private constructor to enforce singleton pattern
+    FLuaStateManager();
+    ~FLuaStateManager();
+
     /**
      * Singleton-like access to the state manager
      * @return Reference to the singleton instance
@@ -50,13 +57,34 @@ public:
      * Get the main Lua state
      * @return Pointer to the main Lua state
      */
-    lua_State* GetLuaState() const { return MainLuaState; }
+    lua_State* GetLuaState();
+
+    /**
+     * Acquire a Lua state from the pool
+     * @param ErrorMessage Error message if acquisition fails
+     * @return Pointer to a Lua state or nullptr if error
+     */
+    lua_State* AcquireState(FString& ErrorMessage);
+
+    /**
+     * Release a Lua state back to the pool
+     * @param State The Lua state to release
+     */
+    void ReleaseState(lua_State* State);
+
+    /**
+     * Configure Lua garbage collection
+     * @param State The Lua state to configure
+     */
+    void ConfigureGarbageCollection(lua_State* State);
+
+    /**
+     * Run a step of garbage collection
+     * @param State The Lua state to run GC on
+     */
+    void RunGarbageCollection(lua_State* State);
 
 private:
-    // Private constructor to enforce singleton pattern
-    FLuaStateManager();
-    ~FLuaStateManager();
-
     // Disallow copying and assignment
     FLuaStateManager(const FLuaStateManager&) = delete;
     FLuaStateManager& operator=(const FLuaStateManager&) = delete;
@@ -75,13 +103,26 @@ private:
      */
     bool HandleLuaError(lua_State* State, FString& ErrorMessage);
 
+    /**
+     * Error handler function for Lua errors with stack trace
+     * @param State The Lua state
+     * @return 1 (the error message with stack trace)
+     */
+    static int LuaErrorHandler(lua_State* State);
+
 private:
     // Main Lua state
     lua_State* MainLuaState;
+
+    // Pool of Lua states for script components
+    TArray<lua_State*> StatePool;
 
     // Critical section for thread safety
     FCriticalSection StateLock;
 
     // Flag to track initialization state
     bool bIsInitialized;
+
+    // Maximum number of states to keep in the pool
+    static constexpr int32 MaxPoolSize = 10;
 };

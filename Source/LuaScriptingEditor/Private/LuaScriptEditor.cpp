@@ -166,4 +166,4 @@ void FLuaScriptEditor::ExecuteScript()
     }
 }
 
-#undef LOCTEXT_NAMESPACEESPACE
+#undef LOCTEXT_NAMESPACE

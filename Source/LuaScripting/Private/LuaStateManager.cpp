@@ -11,16 +11,19 @@ extern "C" {
 #include "lauxlib.h"
 }
 
+// Define log category
+DEFINE_LOG_CATEGORY(LogLuaScripting);
+
 // Static instance for singleton pattern
-static FLuaStateManager* LuaStateManagerInstance = nullptr;
+static TSharedPtr<FLuaStateManager, ESPMode::ThreadSafe> LuaStateManagerInstance;
 
 FLuaStateManager& FLuaStateManager::Get()
 {
-    if (!LuaStateManagerInstance)
+    if (!LuaStateManagerInstance.IsValid())
     {
-        LuaStateManagerInstance = new FLuaStateManager();
+        LuaStateManagerInstance = MakeShareable(new FLuaStateManager());
     }
-    return *LuaStateManagerInstance;
+    return *LuaStateManagerInstance.Get();
 }
 
 FLuaStateManager::FLuaStateManager()
@@ -47,15 +50,18 @@ bool FLuaStateManager::Initialize()
     MainLuaState = luaL_newstate();
     if (!MainLuaState)
     {
-        UE_LOG(LogTemp, Error, TEXT("Failed to create Lua state"));
+        UE_LOG(LogLuaScripting, Error, TEXT("Failed to create Lua state"));
         return false;
     }
 
     // Set up the Lua state with standard libraries and UE-specific functions
     SetupLuaState(MainLuaState);
 
+    // Configure garbage collection
+    ConfigureGarbageCollection(MainLuaState);
+
     bIsInitialized = true;
-    UE_LOG(LogTemp, Log, TEXT("Lua state manager initialized successfully"));
+    UE_LOG(LogLuaScripting, Log, TEXT("Lua state manager initialized successfully"));
     return true;
 }
 
@@ -63,14 +69,185 @@ void FLuaStateManager::Shutdown()
 {
     FScopeLock Lock(&StateLock);
 
+    // Clean up the main state
     if (MainLuaState)
     {
         lua_close(MainLuaState);
         MainLuaState = nullptr;
     }
 
+    // Clean up the state pool
+    for (lua_State* State : StatePool)
+    {
+        if (State)
+        {
+            lua_close(State);
+        }
+    }
+    StatePool.Empty();
+
     bIsInitialized = false;
-    UE_LOG(LogTemp, Log, TEXT("Lua state manager shut down"));
+    UE_LOG(LogLuaScripting, Log, TEXT("Lua state manager shut down"));
+}
+
+lua_State* FLuaStateManager::GetLuaState()
+{
+    FScopeLock Lock(&StateLock);
+
+    if (!MainLuaState)
+    {
+        if (!Initialize())
+        {
+            UE_LOG(LogLuaScripting, Error, TEXT("Failed to initialize Lua state in GetLuaState"));
+            return nullptr;
+        }
+    }
+
+    return MainLuaState;
+}
+
+lua_State* FLuaStateManager::AcquireState(FString& ErrorMessage)
+{
+    FScopeLock Lock(&StateLock);
+
+    // Check for a state in the pool
+    if (StatePool.Num() > 0)
+    {
+        lua_State* State = StatePool.Pop(EAllowShrinking::Yes);
+
+        // Important: Re-setup the state to ensure all bindings are fresh
+        SetupLuaState(State);
+
+        // Run garbage collection to clean up any leftover data
+        lua_gc(State, LUA_GCCOLLECT, 0);
+        return State;
+    }
+
+    // Create a new state
+    lua_State* NewState = luaL_newstate();
+    if (!NewState)
+    {
+        ErrorMessage = TEXT("Failed to create new Lua state");
+        return nullptr;
+    }
+
+    // Set up the state
+    SetupLuaState(NewState);
+    ConfigureGarbageCollection(NewState);
+
+    return NewState;
+}
+
+void FLuaStateManager::ReleaseState(lua_State* State)
+{
+    if (!State)
+    {
+        return;
+    }
+
+    FScopeLock Lock(&StateLock);
+
+    // Check if we should keep it in the pool
+    if (StatePool.Num() < MaxPoolSize)
+    {
+        // For Lua 5.4, we need a more thorough reset approach
+        // Rather than trying to clear everything individually, which is prone to errors,
+        // we'll run a reset script that clears the environment
+
+        // Clear the global table while preserving core Lua functionality
+        static const char* resetScript = R"(
+            -- Store a reference to core functions we want to keep
+            local _keep = {
+                assert = assert,
+                collectgarbage = collectgarbage,
+                error = error,
+                getmetatable = getmetatable,
+                ipairs = ipairs,
+                load = load,
+                next = next,
+                pairs = pairs,
+                pcall = pcall,
+                print = print,
+                rawequal = rawequal,
+                rawget = rawget,
+                rawlen = rawlen,
+                rawset = rawset,
+                select = select,
+                setmetatable = setmetatable,
+                tonumber = tonumber,
+                tostring = tostring,
+                type = type,
+                xpcall = xpcall,
+                -- Tables to keep
+                string = string,
+                table = table,
+                math = math,
+                coroutine = coroutine,
+                os = os,
+                package = package,
+                debug = debug,
+                -- Core variables
+                _VERSION = _VERSION,
+                _G = _G
+            }
+            
+            -- Clear all globals except those in _keep
+            for k in pairs(_G) do
+                if not _keep[k] then
+                    _G[k] = nil
+                end
+            end
+        )";
+
+        // Execute the reset script
+        if (luaL_dostring(State, resetScript) != LUA_OK)
+        {
+            // If reset fails, log and close the state instead of reusing it
+            const char* ErrorMsg = lua_tostring(State, -1);
+            UE_LOG(LogLuaScripting, Warning, TEXT("Failed to reset Lua state: %s"), UTF8_TO_TCHAR(ErrorMsg));
+            lua_pop(State, 1);
+
+            lua_close(State);
+            return;
+        }
+
+        // Run garbage collection
+        lua_gc(State, LUA_GCCOLLECT, 0);
+
+        // Add to pool
+        StatePool.Add(State);
+    }
+    else
+    {
+        // Just close it
+        lua_close(State);
+    }
+}
+
+void FLuaStateManager::ConfigureGarbageCollection(lua_State* State)
+{
+    if (!State)
+    {
+        return;
+    }
+
+    // Set up incremental GC (Lua 5.4+)
+    lua_gc(State, LUA_GCGEN, 0, 0);
+
+    // Configure GC parameters
+    lua_gc(State, LUA_GCSETPAUSE, 150);    // 150% pause between cycles
+    lua_gc(State, LUA_GCSETSTEPMUL, 200);  // 200% speed relative to allocation
+}
+
+void FLuaStateManager::RunGarbageCollection(lua_State* State)
+{
+    if (!State)
+    {
+        return;
+    }
+
+    // Run a step of garbage collection
+    lua_gc(State, LUA_GCSTEP, 10);  // 10 "kilobytes" of work
 }
 
 void FLuaStateManager::SetupLuaState(lua_State* State)
@@ -83,6 +260,17 @@ void FLuaStateManager::SetupLuaState(lua_State* State)
     FLuaBinding::RegisterMathFunctions(State);
     FLuaBinding::RegisterLogFunctions(State);
     FLuaBinding::RegisterActorFunctions(State);
+}
+
+int FLuaStateManager::LuaErrorHandler(lua_State* State)
+{
+    // Get the error message
+    const char* ErrorMsg = lua_tostring(State, -1);
+
+    // Generate a stack trace
+    luaL_traceback(State, State, ErrorMsg, 1);
+
+    return 1;  // Return the stack trace as the error message
 }
 
 bool FLuaStateManager::ExecuteString(const FString& ScriptString, FString& ErrorMessage)
@@ -98,6 +286,10 @@ bool FLuaStateManager::ExecuteString(const FString& ScriptString, FString& Error
     // Convert FString to ANSI string
     const char* Script = TCHAR_TO_UTF8(*ScriptString);
 
+    // Push error handler function
+    lua_pushcfunction(MainLuaState, LuaErrorHandler);
+    int ErrorHandlerIndex = lua_gettop(MainLuaState);
+
     // Load the string as Lua code
     int Status = luaL_loadstring(MainLuaState, Script);
     if (Status != LUA_OK)
@@ -105,8 +297,12 @@ bool FLuaStateManager::ExecuteString(const FString& ScriptString, FString& Error
         return HandleLuaError(MainLuaState, ErrorMessage);
     }
 
-    // Execute the loaded code
-    Status = lua_pcall(MainLuaState, 0, LUA_MULTRET, 0);
+    // Execute the loaded code with error handler
+    Status = lua_pcall(MainLuaState, 0, LUA_MULTRET, ErrorHandlerIndex);
+
+    // Remove the error handler
+    lua_remove(MainLuaState, ErrorHandlerIndex);
+
     if (Status != LUA_OK)
     {
         return HandleLuaError(MainLuaState, ErrorMessage);
@@ -145,6 +341,6 @@ bool FLuaStateManager::HandleLuaError(lua_State* State, FString& ErrorMessage)
     // Pop the error message from the stack
     lua_pop(State, 1);
 
-    UE_LOG(LogTemp, Error, TEXT("Lua error: %s"), *ErrorMessage);
+    UE_LOG(LogLuaScripting, Error, TEXT("Lua error: %s"), *ErrorMessage);
     return false;
 }

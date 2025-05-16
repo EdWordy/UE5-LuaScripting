@@ -1,12 +1,9 @@
-// LuaScript.cpp
 #include "LuaScript.h"
 #include "LuaStateManager.h"
 #include "Misc/FileHelper.h"
 
 ULuaScript::ULuaScript()
 {
-    // Initialize with default empty script
-    ScriptContent = TEXT("-- Lua script\n\nfunction init()\n    UE.Print(\"Script initialized\")\nend\n\nfunction tick(deltaTime)\n    -- Called every frame\nend\n");
 }
 
 bool ULuaScript::Execute(FString& ErrorMessage)
