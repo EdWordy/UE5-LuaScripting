@@ -11,9 +11,6 @@ extern "C" {
 #include "lauxlib.h"
 }
 
-// Define log category
-DEFINE_LOG_CATEGORY(LogLuaScripting);
-
 // Static instance for singleton pattern
 static TSharedPtr<FLuaStateManager, ESPMode::ThreadSafe> LuaStateManagerInstance;
 

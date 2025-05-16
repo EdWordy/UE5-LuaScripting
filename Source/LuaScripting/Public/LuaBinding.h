@@ -68,7 +68,19 @@ public:
     static void SetGlobalUObject(lua_State* L, const char* Name, UObject* Object);
 
 private:
+    // Method dispatching
+    static int UObjectIndex(lua_State* L);
+    static int UObjectToString(lua_State* L);
+    static int DispatchUObjectMethod(lua_State* L, UObject* Object, const char* MethodName);
+
+    // Helper functions for common UE structs
+    static void PushVector(lua_State* L, const FVector& Vector);
+    static FVector GetVector(lua_State* L, int Index);
+    static void PushRotator(lua_State* L, const FRotator& Rotator);
+    static FRotator GetRotator(lua_State* L, int Index);
+
     // Core function implementations (Lua C functions)
+    static int Lua_GetWorld(lua_State* L);
     static int Lua_Print(lua_State* L);
     static int Lua_GetDeltaTime(lua_State* L);
     static int Lua_Trace(lua_State* L);
@@ -77,4 +89,7 @@ private:
     static int Lua_FindActor(lua_State* L);
     static int Lua_SpawnActor(lua_State* L);
     static int Lua_DestroyActor(lua_State* L);
+
+    // Helper function to register the event system
+    static void RegisterEventSystem(lua_State* L);
 };

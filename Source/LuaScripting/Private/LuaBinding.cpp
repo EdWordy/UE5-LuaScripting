@@ -1,9 +1,11 @@
 #include "LuaBinding.h"
-#include "Engine/World.h"
+#include "LuaStateManager.h"
 #include "GameFramework/Actor.h"
+#include "Kismet/GameplayStatics.h"
+#include "Engine/World.h"
+#include "UObject/UObjectHash.h"
+#include "UObject/UObjectIterator.h"
 #include "EngineUtils.h"
-#include "UObject/UObjectGlobals.h"
-#include "UObject/WeakObjectPtr.h"
 
 // Include Lua headers
 extern "C" {
@@ -12,274 +14,59 @@ extern "C" {
 #include "lauxlib.h"
 }
 
-// UObject userdata structure for Lua
-struct LuaUObject
-{
-    TWeakObjectPtr<UObject> Object;
-};
-
-// MetaTable name for UObjects
-static const char* UObjectMetaTableName = "UE.UObject";
+DEFINE_LOG_CATEGORY(LogLuaScripting)
 
 void FLuaBinding::RegisterCoreFunctions(lua_State* L)
 {
-    // Create a table for the UE namespace
+    // Create the UE namespace table
     lua_newtable(L);
 
-    // Register the print function
+    // Register core functions
     lua_pushcfunction(L, Lua_Print);
     lua_setfield(L, -2, "Print");
 
-    // Register the GetDeltaTime function
     lua_pushcfunction(L, Lua_GetDeltaTime);
     lua_setfield(L, -2, "GetDeltaTime");
+
+    // Add GetWorld function
+    lua_pushcfunction(L, Lua_GetWorld);
+    lua_setfield(L, -2, "GetWorld");
 
     // Set the UE table as a global
     lua_setglobal(L, "UE");
 
-    // Create a metatable for UObjects
-    luaL_newmetatable(L, UObjectMetaTableName);
+    // Register the event system
+    RegisterEventSystem(L);
 
-    // Set the __gc metamethod for UObject cleanup
-    lua_pushcfunction(L, [](lua_State* L) -> int {
-        LuaUObject* UserData = (LuaUObject*)luaL_checkudata(L, 1, UObjectMetaTableName);
-        UserData->Object.Reset();
-        return 0;
-        });
-    lua_setfield(L, -2, "__gc");
-
-    // Set the __index metamethod for UObject property access
-    lua_pushcfunction(L, [](lua_State* L) -> int {
-        LuaUObject* UserData = (LuaUObject*)luaL_checkudata(L, 1, UObjectMetaTableName);
-        const char* PropertyName = luaL_checkstring(L, 2);
-
-        if (!UserData->Object.IsValid())
-        {
-            return luaL_error(L, "Attempt to access property of invalid UObject");
-        }
-
-        UObject* Object = UserData->Object.Get();
-        UClass* Class = Object->GetClass();
-
-        // Look for a property with the given name
-        FProperty* Property = Class->FindPropertyByName(FName(PropertyName));
-        if (Property)
-        {
-            // Get property value and push to Lua stack
-            // This is a simplified example - a real implementation would handle different property types
-            if (Property->IsA<FBoolProperty>())
-            {
-                FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property);
-                bool Value = BoolProperty->GetPropertyValue_InContainer(Object);
-                lua_pushboolean(L, Value);
-                return 1;
-            }
-            else if (Property->IsA<FIntProperty>())
-            {
-                FIntProperty* IntProperty = CastField<FIntProperty>(Property);
-                int32 Value = IntProperty->GetPropertyValue_InContainer(Object);
-                lua_pushinteger(L, Value);
-                return 1;
-            }
-            else if (Property->IsA<FFloatProperty>())
-            {
-                FFloatProperty* FloatProperty = CastField<FFloatProperty>(Property);
-                float Value = FloatProperty->GetPropertyValue_InContainer(Object);
-                lua_pushnumber(L, Value);
-                return 1;
-            }
-            else if (Property->IsA<FStrProperty>())
-            {
-                FStrProperty* StrProperty = CastField<FStrProperty>(Property);
-                FString Value = StrProperty->GetPropertyValue_InContainer(Object);
-                lua_pushstring(L, TCHAR_TO_UTF8(*Value));
-                return 1;
-            }
-            else if (Property->IsA<FObjectProperty>())
-            {
-                FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property);
-                UObject* Value = ObjectProperty->GetPropertyValue_InContainer(Object);
-                PushUObject(L, Value);
-                return 1;
-            }
-            // Add more property types as needed
-        }
-
-        // Look for a function with the given name
-        UFunction* Function = Class->FindFunctionByName(FName(PropertyName));
-        if (Function)
-        {
-            // Push a closure that will call the UFunction when invoked
-            lua_pushcfunction(L, [](lua_State* L) -> int {
-                LuaUObject* UserData = (LuaUObject*)luaL_checkudata(L, lua_upvalueindex(1), UObjectMetaTableName);
-                const char* FunctionName = lua_tostring(L, lua_upvalueindex(2));
-
-                if (!UserData->Object.IsValid())
-                {
-                    return luaL_error(L, "Attempt to call method of invalid UObject");
-                }
-
-                UObject* Object = UserData->Object.Get();
-                UFunction* Function = Object->FindFunction(FName(FunctionName));
-
-                if (!Function)
-                {
-                    return luaL_error(L, "Function %s not found", FunctionName);
-                }
-
-                // This is a simplified example. A real implementation would need to:
-                // 1. Create a buffer for the function parameters
-                // 2. Fill the buffer with the parameters from the Lua stack
-                // 3. Call the function
-                // 4. Extract the return values and push them to the Lua stack
-
-                // For now, just call the function with no parameters
-                Object->ProcessEvent(Function, nullptr);
-
-                // Return 0 values to Lua
-                return 0;
-                });
-
-            // Set upvalues for the closure
-            lua_pushvalue(L, 1); // The UObject userdata
-            lua_pushstring(L, PropertyName); // The function name
-            lua_setupvalue(L, -3, 1);
-            lua_setupvalue(L, -2, 2);
-
-            return 1;
-        }
-
-        // Property or function not found
-        lua_pushnil(L);
-        return 1;
-        });
-    lua_setfield(L, -2, "__index");
-
-    // Set the __newindex metamethod for UObject property assignment
-    lua_pushcfunction(L, [](lua_State* L) -> int {
-        LuaUObject* UserData = (LuaUObject*)luaL_checkudata(L, 1, UObjectMetaTableName);
-        const char* PropertyName = luaL_checkstring(L, 2);
-
-        if (!UserData->Object.IsValid())
-        {
-            return luaL_error(L, "Attempt to set property of invalid UObject");
-        }
-
-        UObject* Object = UserData->Object.Get();
-        UClass* Class = Object->GetClass();
-
-        // Look for a property with the given name
-        FProperty* Property = Class->FindPropertyByName(FName(PropertyName));
-        if (Property)
-        {
-            // Set property value from Lua stack
-            // This is a simplified example - a real implementation would handle different property types
-            if (Property->IsA<FBoolProperty>())
-            {
-                FBoolProperty* BoolProperty = CastField<FBoolProperty>(Property);
-                bool Value = lua_toboolean(L, 3) != 0;
-                BoolProperty->SetPropertyValue_InContainer(Object, Value);
-            }
-            else if (Property->IsA<FIntProperty>())
-            {
-                FIntProperty* IntProperty = CastField<FIntProperty>(Property);
-                int32 Value = (int32)lua_tointeger(L, 3);
-                IntProperty->SetPropertyValue_InContainer(Object, Value);
-            }
-            else if (Property->IsA<FFloatProperty>())
-            {
-                FFloatProperty* FloatProperty = CastField<FFloatProperty>(Property);
-                float Value = (float)lua_tonumber(L, 3);
-                FloatProperty->SetPropertyValue_InContainer(Object, Value);
-            }
-            else if (Property->IsA<FStrProperty>())
-            {
-                FStrProperty* StrProperty = CastField<FStrProperty>(Property);
-                const char* CStrValue = lua_tostring(L, 3);
-                FString Value = UTF8_TO_TCHAR(CStrValue);
-                StrProperty->SetPropertyValue_InContainer(Object, Value);
-            }
-            else if (Property->IsA<FObjectProperty>())
-            {
-                FObjectProperty* ObjectProperty = CastField<FObjectProperty>(Property);
-                UObject* Value = GetUObject(L, 3);
-                ObjectProperty->SetPropertyValue_InContainer(Object, Value);
-            }
-            // Add more property types as needed
-
-            return 0;
-        }
-
-        // Property not found
-        return luaL_error(L, "Property %s not found or cannot be set", PropertyName);
-        });
-    lua_setfield(L, -2, "__newindex");
-
-    // Pop the metatable
-    lua_pop(L, 1);
+    UE_LOG(LogLuaScripting, Log, TEXT("Core functions registered"));
 }
 
 void FLuaBinding::RegisterMathFunctions(lua_State* L)
 {
-    // Create a table for the UE.Math namespace
+    // Get the UE namespace table
     lua_getglobal(L, "UE");
+
+    // Create the math table
     lua_newtable(L);
 
-    // Push vector creation function
-    lua_pushcfunction(L, [](lua_State* L) -> int {
-        float X = (float)luaL_checknumber(L, 1);
-        float Y = (float)luaL_checknumber(L, 2);
-        float Z = (float)luaL_checknumber(L, 3);
+    // Add math functions here
+    // Example: Vector operations, rotations, transforms, etc.
 
-        // Create a table to represent the vector
-        lua_newtable(L);
-
-        lua_pushnumber(L, X);
-        lua_setfield(L, -2, "X");
-
-        lua_pushnumber(L, Y);
-        lua_setfield(L, -2, "Y");
-
-        lua_pushnumber(L, Z);
-        lua_setfield(L, -2, "Z");
-
-        return 1;
-        });
-    lua_setfield(L, -2, "Vector");
-
-    // Push rotation creation function
-    lua_pushcfunction(L, [](lua_State* L) -> int {
-        float Pitch = (float)luaL_checknumber(L, 1);
-        float Yaw = (float)luaL_checknumber(L, 2);
-        float Roll = (float)luaL_checknumber(L, 3);
-
-        // Create a table to represent the rotation
-        lua_newtable(L);
-
-        lua_pushnumber(L, Pitch);
-        lua_setfield(L, -2, "Pitch");
-
-        lua_pushnumber(L, Yaw);
-        lua_setfield(L, -2, "Yaw");
-
-        lua_pushnumber(L, Roll);
-        lua_setfield(L, -2, "Roll");
-
-        return 1;
-        });
-    lua_setfield(L, -2, "Rotation");
-
-    // Set the Math table in the UE namespace
+    // Set the math table in the UE namespace
     lua_setfield(L, -2, "Math");
 
     // Pop the UE table
     lua_pop(L, 1);
+
+    UE_LOG(LogLuaScripting, Log, TEXT("Math functions registered"));
 }
 
 void FLuaBinding::RegisterLogFunctions(lua_State* L)
 {
-    // Create a table for the UE.Log namespace
+    // Get the UE namespace table
     lua_getglobal(L, "UE");
+
+    // Create the log table
     lua_newtable(L);
 
     // Register log functions
@@ -292,47 +79,87 @@ void FLuaBinding::RegisterLogFunctions(lua_State* L)
     lua_pushcfunction(L, Lua_Error);
     lua_setfield(L, -2, "Error");
 
-    // Set the Log table in the UE namespace
+    // Set the log table in the UE namespace
     lua_setfield(L, -2, "Log");
 
     // Pop the UE table
     lua_pop(L, 1);
+
+    UE_LOG(LogLuaScripting, Log, TEXT("Log functions registered"));
 }
 
 void FLuaBinding::RegisterActorFunctions(lua_State* L)
 {
-    // Create a table for the UE.Actor namespace
+    // Get the UE namespace table
     lua_getglobal(L, "UE");
+
+    // Create the Actor table
     lua_newtable(L);
 
     // Register actor functions
     lua_pushcfunction(L, Lua_FindActor);
-    lua_setfield(L, -2, "Find");
+    lua_setfield(L, -2, "FindActor");
 
     lua_pushcfunction(L, Lua_SpawnActor);
-    lua_setfield(L, -2, "Spawn");
+    lua_setfield(L, -2, "SpawnActor");
 
     lua_pushcfunction(L, Lua_DestroyActor);
-    lua_setfield(L, -2, "Destroy");
+    lua_setfield(L, -2, "DestroyActor");
 
     // Set the Actor table in the UE namespace
     lua_setfield(L, -2, "Actor");
 
     // Pop the UE table
     lua_pop(L, 1);
+
+    UE_LOG(LogLuaScripting, Log, TEXT("Actor functions registered"));
 }
 
 UWorld* FLuaBinding::GetWorld(lua_State* L)
 {
-    // Try to get the first valid World
-    for (TObjectIterator<UWorld> It; It; ++It)
+    // Try to get the world from the global "self" actor if available
+    lua_getglobal(L, "self");
+    if (!lua_isnil(L, -1))
     {
-        UWorld* World = *It;
-        if (World && World->IsGameWorld())
+        AActor* SelfActor = Cast<AActor>(GetUObject(L, -1));
+        lua_pop(L, 1);
+
+        if (SelfActor)
         {
-            return World;
+            return SelfActor->GetWorld();
         }
     }
+    else
+    {
+        lua_pop(L, 1);
+    }
+
+    // Try to get the world from the component if available
+    lua_getglobal(L, "component");
+    if (!lua_isnil(L, -1))
+    {
+        UActorComponent* Component = Cast<UActorComponent>(GetUObject(L, -1));
+        lua_pop(L, 1);
+
+        if (Component)
+        {
+            return Component->GetWorld();
+        }
+    }
+    else
+    {
+        lua_pop(L, 1);
+    }
+
+    // As a last resort, try to get the game world
+    for (const FWorldContext& Context : GEngine->GetWorldContexts())
+    {
+        if (Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+        {
+            return Context.World();
+        }
+    }
+
     return nullptr;
 }
 
@@ -345,28 +172,49 @@ void FLuaBinding::PushUObject(lua_State* L, UObject* Object)
     }
 
     // Create a userdata to hold the UObject pointer
-    LuaUObject* UserData = (LuaUObject*)lua_newuserdata(L, sizeof(LuaUObject));
-    UserData->Object = Object;
+    void** UserData = (void**)lua_newuserdata(L, sizeof(void*));
+    *UserData = Object;
 
-    // Set the metatable for the userdata
-    luaL_getmetatable(L, UObjectMetaTableName);
+    // Create or get the metatable for UObject
+    if (luaL_newmetatable(L, "UObject"))
+    {
+        // First time creation
+        // Setup the __index metamethod for method dispatching
+        lua_pushcfunction(L, UObjectIndex);
+        lua_setfield(L, -2, "__index");
+
+        // Setup __tostring metamethod to display UObject info
+        lua_pushcfunction(L, UObjectToString);
+        lua_setfield(L, -2, "__tostring");
+
+        // Add garbage collection method
+        lua_pushcfunction(L, [](lua_State* L) {
+            // UObjects are managed by Unreal, not Lua, so we don't need to do anything here
+            return 0;
+            });
+        lua_setfield(L, -2, "__gc");
+    }
+
+    // Set the metatable for this userdata
     lua_setmetatable(L, -2);
 }
 
 UObject* FLuaBinding::GetUObject(lua_State* L, int Index)
 {
-    if (lua_isnil(L, Index))
+    if (!lua_isuserdata(L, Index))
     {
         return nullptr;
     }
 
-    LuaUObject* UserData = (LuaUObject*)luaL_checkudata(L, Index, UObjectMetaTableName);
-    if (!UserData || !UserData->Object.IsValid())
+    // Check if we have a valid userdata with our metatable
+    void* UserData = lua_touserdata(L, Index);
+    if (!UserData)
     {
         return nullptr;
     }
 
-    return UserData->Object.Get();
+    // We should validate this is actually a UObject, but for simplicity we'll just cast
+    return static_cast<UObject*>(*(void**)UserData);
 }
 
 void FLuaBinding::SetGlobalUObject(lua_State* L, const char* Name, UObject* Object)
@@ -375,27 +223,429 @@ void FLuaBinding::SetGlobalUObject(lua_State* L, const char* Name, UObject* Obje
     lua_setglobal(L, Name);
 }
 
+// uobject handling
+
+int FLuaBinding::UObjectIndex(lua_State* L)
+{
+    // Get the UObject from the userdata
+    UObject* Object = GetUObject(L, 1);
+    if (!Object)
+    {
+        return luaL_error(L, "Invalid UObject in __index");
+    }
+
+    // Get the property/method name
+    const char* MethodName = lua_tostring(L, 2);
+    if (!MethodName)
+    {
+        return luaL_error(L, "Invalid method name in __index");
+    }
+
+    // Check if this is a known method
+    return DispatchUObjectMethod(L, Object, MethodName);
+}
+
+int FLuaBinding::UObjectToString(lua_State* L)
+{
+    UObject* Object = GetUObject(L, 1);
+    if (Object)
+    {
+        lua_pushfstring(L, "UObject: %p", Object);
+
+        // Add class name if available
+        if (Object->GetClass())
+        {
+            lua_pushfstring(L, " (%s)", TCHAR_TO_UTF8(*Object->GetClass()->GetName()));
+            lua_concat(L, 2);
+        }
+    }
+    else
+    {
+        lua_pushstring(L, "Invalid UObject");
+    }
+
+    return 1;
+}
+
+int FLuaBinding::DispatchUObjectMethod(lua_State* L, UObject* Object, const char* MethodName)
+{
+    FString MethodString = UTF8_TO_TCHAR(MethodName);
+
+    // Component methods
+    UActorComponent* Component = Cast<UActorComponent>(Object);
+    if (Component)
+    {
+        // Methods for all UActorComponent types
+        if (MethodString == TEXT("GetOwner"))
+        {
+            AActor* Owner = Component->GetOwner();
+            PushUObject(L, Owner);
+            return 1;
+        }
+    }
+
+    // Handle common Actor methods
+    AActor* Actor = Cast<AActor>(Object);
+    if (Actor)
+    {
+        // Location methods
+        if (MethodString == TEXT("GetActorLocation"))
+        {
+            const FVector& Location = Actor->GetActorLocation();
+            PushVector(L, Location);
+            return 1;
+        }
+        else if (MethodString == TEXT("SetActorLocation"))
+        {
+            // Expect a table with X, Y, Z
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "SetActorLocation requires a vector parameter");
+            }
+
+            FVector NewLocation = GetVector(L, 3);
+            bool bSuccess = Actor->SetActorLocation(NewLocation);
+            lua_pushboolean(L, bSuccess);
+            return 1;
+        }
+
+        // Rotation methods
+        else if (MethodString == TEXT("GetActorRotation"))
+        {
+            const FRotator& Rotation = Actor->GetActorRotation();
+            PushRotator(L, Rotation);
+            return 1;
+        }
+        else if (MethodString == TEXT("SetActorRotation"))
+        {
+            // Expect a table with Pitch, Yaw, Roll
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "SetActorRotation requires a rotator parameter");
+            }
+
+            FRotator NewRotation = GetRotator(L, 3);
+            bool bSuccess = Actor->SetActorRotation(NewRotation);
+            lua_pushboolean(L, bSuccess);
+            return 1;
+        }
+
+        // Scale methods
+        else if (MethodString == TEXT("GetActorScale3D"))
+        {
+            const FVector& Scale = Actor->GetActorScale3D();
+            PushVector(L, Scale);
+            return 1;
+        }
+        else if (MethodString == TEXT("SetActorScale3D"))
+        {
+            // Expect a table with X, Y, Z
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "SetActorScale3D requires a vector parameter");
+            }
+
+            FVector NewScale = GetVector(L, 3);
+            Actor->SetActorScale3D(NewScale);
+            return 0;
+        }
+
+        // Visibility methods
+        else if (MethodString == TEXT("SetActorHiddenInGame"))
+        {
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "SetActorHiddenInGame requires a boolean parameter");
+            }
+
+            bool bNewHidden = (lua_toboolean(L, 3) != 0);
+            Actor->SetActorHiddenInGame(bNewHidden);
+            return 0;
+        }
+        else if (MethodString == TEXT("IsHidden"))
+        {
+            bool bHidden = Actor->IsHidden();
+            lua_pushboolean(L, bHidden);
+            return 1;
+        }
+
+        // Tags
+        else if (MethodString == TEXT("HasTag"))
+        {
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "HasTag requires a string parameter");
+            }
+
+            const char* TagName = lua_tostring(L, 3);
+            bool bHasTag = Actor->ActorHasTag(FName(UTF8_TO_TCHAR(TagName)));
+            lua_pushboolean(L, bHasTag);
+            return 1;
+        }
+        else if (MethodString == TEXT("AddTag"))
+        {
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "AddTag requires a string parameter");
+            }
+
+            const char* TagName = lua_tostring(L, 3);
+            Actor->Tags.AddUnique(FName(UTF8_TO_TCHAR(TagName)));
+            return 0;
+        }
+        else if (MethodString == TEXT("RemoveTag"))
+        {
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "RemoveTag requires a string parameter");
+            }
+
+            const char* TagName = lua_tostring(L, 3);
+            Actor->Tags.Remove(FName(UTF8_TO_TCHAR(TagName)));
+            return 0;
+        }
+        else if (MethodString == TEXT("GetNumTags"))
+        {
+            lua_pushinteger(L, Actor->Tags.Num());
+            return 1;
+        }
+
+        // Other actor methods
+        else if (MethodString == TEXT("GetLifeSpan"))
+        {
+            lua_pushnumber(L, Actor->GetLifeSpan());
+            return 1;
+        }
+        else if (MethodString == TEXT("SetLifeSpan"))
+        {
+            if (lua_gettop(L) < 3)
+            {
+                return luaL_error(L, "SetLifeSpan requires a number parameter");
+            }
+
+            float Lifespan = (float)lua_tonumber(L, 3);
+            Actor->SetLifeSpan(Lifespan);
+            return 0;
+        }
+        else if (MethodString == TEXT("CanEverTick"))
+        {
+            lua_pushboolean(L, Actor->PrimaryActorTick.bCanEverTick);
+            return 1;
+        }
+    }
+
+    // UObject methods that apply to any UObject
+    if (MethodString == TEXT("GetName"))
+    {
+        lua_pushstring(L, TCHAR_TO_UTF8(*Object->GetName()));
+        return 1;
+    }
+    else if (MethodString == TEXT("GetClass"))
+    {
+        if (Object->GetClass())
+        {
+            lua_pushstring(L, TCHAR_TO_UTF8(*Object->GetClass()->GetName()));
+        }
+        else
+        {
+            lua_pushnil(L);
+        }
+        return 1;
+    }
+    else if (MethodString == TEXT("IsA"))
+    {
+        if (lua_gettop(L) < 3)
+        {
+            return luaL_error(L, "IsA requires a string parameter");
+        }
+
+        const char* ClassName = lua_tostring(L, 3);
+        UClass* ClassToCheck = FindObject<UClass>(nullptr, UTF8_TO_TCHAR(ClassName));
+
+        if (ClassToCheck)
+        {
+            lua_pushboolean(L, Object->IsA(ClassToCheck));
+        }
+        else
+        {
+            // Class not found
+            lua_pushboolean(L, false);
+        }
+        return 1;
+    }
+
+    // If we get here, the method is not found
+    // Return nil instead of raising an error to be more forgiving in scripts
+    lua_pushnil(L);
+    return 1;
+}
+
+// Helper functions for vector handling
+
+void FLuaBinding::PushVector(lua_State* L, const FVector& Vector)
+{
+    // Create a table with X, Y, Z fields
+    lua_newtable(L);
+
+    lua_pushnumber(L, Vector.X);
+    lua_setfield(L, -2, "X");
+
+    lua_pushnumber(L, Vector.Y);
+    lua_setfield(L, -2, "Y");
+
+    lua_pushnumber(L, Vector.Z);
+    lua_setfield(L, -2, "Z");
+}
+
+FVector FLuaBinding::GetVector(lua_State* L, int Index)
+{
+    FVector Result = FVector::ZeroVector;
+
+    if (lua_istable(L, Index))
+    {
+        // Get X component
+        lua_getfield(L, Index, "X");
+        if (lua_isnumber(L, -1))
+        {
+            Result.X = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+
+        // Get Y component
+        lua_getfield(L, Index, "Y");
+        if (lua_isnumber(L, -1))
+        {
+            Result.Y = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+
+        // Get Z component
+        lua_getfield(L, Index, "Z");
+        if (lua_isnumber(L, -1))
+        {
+            Result.Z = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+
+    return Result;
+}
+
+// Helper functions for rotator handling
+
+void FLuaBinding::PushRotator(lua_State* L, const FRotator& Rotator)
+{
+    // Create a table with Pitch, Yaw, Roll fields
+    lua_newtable(L);
+
+    lua_pushnumber(L, Rotator.Pitch);
+    lua_setfield(L, -2, "Pitch");
+
+    lua_pushnumber(L, Rotator.Yaw);
+    lua_setfield(L, -2, "Yaw");
+
+    lua_pushnumber(L, Rotator.Roll);
+    lua_setfield(L, -2, "Roll");
+}
+
+FRotator FLuaBinding::GetRotator(lua_State* L, int Index)
+{
+    FRotator Result = FRotator::ZeroRotator;
+
+    if (lua_istable(L, Index))
+    {
+        // Get Pitch component
+        lua_getfield(L, Index, "Pitch");
+        if (lua_isnumber(L, -1))
+        {
+            Result.Pitch = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+
+        // Get Yaw component
+        lua_getfield(L, Index, "Yaw");
+        if (lua_isnumber(L, -1))
+        {
+            Result.Yaw = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+
+        // Get Roll component
+        lua_getfield(L, Index, "Roll");
+        if (lua_isnumber(L, -1))
+        {
+            Result.Roll = (float)lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+    }
+
+    return Result;
+}
+
+// core lua funcs
+
+int FLuaBinding::Lua_GetWorld(lua_State* L)
+{
+    // Get the current world
+    UWorld* World = GetWorld(L);
+
+    if (World)
+    {
+        // Push the world to Lua
+        PushUObject(L, World);
+    }
+    else
+    {
+        // No world available
+        lua_pushnil(L);
+    }
+
+    return 1;
+}
+
 int FLuaBinding::Lua_Print(lua_State* L)
 {
     int NumArgs = lua_gettop(L);
     FString Message;
 
+    // Concatenate all arguments
     for (int i = 1; i <= NumArgs; i++)
     {
-        const char* Str = lua_tostring(L, i);
-        if (Str)
+        if (i > 1)
         {
-            Message += i > 1 ? TEXT("\t") : TEXT("");
-            Message += UTF8_TO_TCHAR(Str);
+            Message += " ";
+        }
+
+        if (lua_isstring(L, i))
+        {
+            Message += UTF8_TO_TCHAR(lua_tostring(L, i));
+        }
+        else if (lua_isnumber(L, i))
+        {
+            Message += FString::Printf(TEXT("%f"), lua_tonumber(L, i));
+        }
+        else if (lua_isboolean(L, i))
+        {
+            Message += lua_toboolean(L, i) ? TEXT("true") : TEXT("false");
+        }
+        else if (lua_isnil(L, i))
+        {
+            Message += TEXT("nil");
+        }
+        else
+        {
+            Message += FString::Printf(TEXT("[%s: %p]"), UTF8_TO_TCHAR(lua_typename(L, lua_type(L, i))), lua_topointer(L, i));
         }
     }
 
-    UE_LOG(LogTemp, Display, TEXT("Lua: %s"), *Message);
+    // Print to log
+    UE_LOG(LogLuaScripting, Display, TEXT("[Lua] %s"), *Message);
 
-    // Print to screen if in PIE or Game mode
-    if (GEngine)
+    // Also print to screen if in PIE or game
+    UWorld* World = GetWorld(L);
+    if (World && (World->WorldType == EWorldType::PIE || World->WorldType == EWorldType::Game))
     {
-        GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Green, FString::Printf(TEXT("Lua: %s"), *Message));
+        GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow, Message);
     }
 
     return 0;
@@ -412,39 +662,28 @@ int FLuaBinding::Lua_GetDeltaTime(lua_State* L)
     {
         lua_pushnumber(L, 0.0f);
     }
+
     return 1;
 }
 
 int FLuaBinding::Lua_Trace(lua_State* L)
 {
     const char* Message = luaL_checkstring(L, 1);
-    UE_LOG(LogTemp, Display, TEXT("Lua: %s"), UTF8_TO_TCHAR(Message));
+    UE_LOG(LogLuaScripting, Log, TEXT("[Lua] %s"), UTF8_TO_TCHAR(Message));
     return 0;
 }
 
 int FLuaBinding::Lua_Warning(lua_State* L)
 {
     const char* Message = luaL_checkstring(L, 1);
-    UE_LOG(LogTemp, Warning, TEXT("Lua Warning: %s"), UTF8_TO_TCHAR(Message));
-
-    if (GEngine)
-    {
-        GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Yellow, FString::Printf(TEXT("Lua Warning: %s"), UTF8_TO_TCHAR(Message)));
-    }
-
+    UE_LOG(LogLuaScripting, Warning, TEXT("[Lua] %s"), UTF8_TO_TCHAR(Message));
     return 0;
 }
 
 int FLuaBinding::Lua_Error(lua_State* L)
 {
     const char* Message = luaL_checkstring(L, 1);
-    UE_LOG(LogTemp, Error, TEXT("Lua Error: %s"), UTF8_TO_TCHAR(Message));
-
-    if (GEngine)
-    {
-        GEngine->AddOnScreenDebugMessage(-1, 5.0f, FColor::Red, FString::Printf(TEXT("Lua Error: %s"), UTF8_TO_TCHAR(Message)));
-    }
-
+    UE_LOG(LogLuaScripting, Error, TEXT("[Lua] %s"), UTF8_TO_TCHAR(Message));
     return 0;
 }
 
@@ -459,83 +698,83 @@ int FLuaBinding::Lua_FindActor(lua_State* L)
         return 1;
     }
 
+    // Find actor by name
+    FString NameToFind = UTF8_TO_TCHAR(ActorName);
     for (TActorIterator<AActor> It(World); It; ++It)
     {
         AActor* Actor = *It;
-        if (Actor && Actor->GetName() == UTF8_TO_TCHAR(ActorName))
+
+        if (Actor->GetName().Equals(NameToFind) || Actor->GetActorLabel().Equals(NameToFind))
         {
             PushUObject(L, Actor);
             return 1;
         }
     }
 
+    // Actor not found
     lua_pushnil(L);
     return 1;
 }
 
 int FLuaBinding::Lua_SpawnActor(lua_State* L)
 {
+    // Check for class name and optional location/rotation
+    const char* ClassName = luaL_checkstring(L, 1);
+
     UWorld* World = GetWorld(L);
     if (!World)
     {
-        return luaL_error(L, "No valid World found");
+        lua_pushnil(L);
+        return 1;
     }
 
-    // Get the class of actor to spawn
-    const char* ClassName = luaL_checkstring(L, 1);
-    UClass* ActorClass = FindObject<UClass>(nullptr, UTF8_TO_TCHAR(ClassName));
-
-    if (!ActorClass || !ActorClass->IsChildOf(AActor::StaticClass()))
+    // Find the UClass by name
+    UClass* ClassToSpawn = nullptr;
+    for (TObjectIterator<UClass> It; It; ++It)
     {
-        return luaL_error(L, "Invalid actor class: %s", ClassName);
+        UClass* Class = *It;
+
+        if (Class->IsChildOf(AActor::StaticClass()) && Class->GetName().Equals(UTF8_TO_TCHAR(ClassName)))
+        {
+            ClassToSpawn = Class;
+            break;
+        }
     }
 
-    // Get spawn transform
+    if (!ClassToSpawn)
+    {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    // Default spawn parameters
     FVector Location = FVector::ZeroVector;
     FRotator Rotation = FRotator::ZeroRotator;
 
-    // Check if a location was provided
-    if (lua_istable(L, 2))
+    // Get location and rotation if provided
+    if (lua_gettop(L) >= 4)
     {
-        lua_getfield(L, 2, "X");
-        Location.X = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 2, "Y");
-        Location.Y = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 2, "Z");
-        Location.Z = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
+        Location.X = (float)luaL_checknumber(L, 2);
+        Location.Y = (float)luaL_checknumber(L, 3);
+        Location.Z = (float)luaL_checknumber(L, 4);
     }
 
-    // Check if a rotation was provided
-    if (lua_istable(L, 3))
+    if (lua_gettop(L) >= 7)
     {
-        lua_getfield(L, 3, "Pitch");
-        Rotation.Pitch = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 3, "Yaw");
-        Rotation.Yaw = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
-
-        lua_getfield(L, 3, "Roll");
-        Rotation.Roll = (float)lua_tonumber(L, -1);
-        lua_pop(L, 1);
+        Rotation.Pitch = (float)luaL_checknumber(L, 5);
+        Rotation.Yaw = (float)luaL_checknumber(L, 6);
+        Rotation.Roll = (float)luaL_checknumber(L, 7);
     }
 
-    // Spawn parameters
+    // Spawn the actor
     FActorSpawnParameters SpawnParams;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
 
-    // Spawn the actor
-    AActor* Actor = World->SpawnActor(ActorClass, &Location, &Rotation, SpawnParams);
+    AActor* NewActor = World->SpawnActor<AActor>(ClassToSpawn, Location, Rotation, SpawnParams);
 
-    if (Actor)
+    if (NewActor)
     {
-        PushUObject(L, Actor);
+        PushUObject(L, NewActor);
     }
     else
     {
@@ -549,12 +788,132 @@ int FLuaBinding::Lua_DestroyActor(lua_State* L)
 {
     AActor* Actor = Cast<AActor>(GetUObject(L, 1));
 
-    if (!Actor)
+    if (Actor)
     {
-        return luaL_error(L, "Invalid actor provided for destruction");
+        Actor->Destroy();
+        lua_pushboolean(L, 1);
+    }
+    else
+    {
+        lua_pushboolean(L, 0);
     }
 
-    Actor->Destroy();
-    lua_pushboolean(L, true);
     return 1;
+}
+
+void FLuaBinding::RegisterEventSystem(lua_State* L)
+{
+    // Create the event system table
+    lua_getglobal(L, "UE");
+    lua_newtable(L);
+
+    // Create events table to store registered events
+    lua_newtable(L);
+    lua_setfield(L, -2, "_events");
+
+    // Add trigger function
+    lua_pushcfunction(L, [](lua_State* L) {
+        const char* EventName = luaL_checkstring(L, 1);
+
+        // Get the events table
+        lua_getglobal(L, "UE");
+        lua_getfield(L, -1, "Event");
+        lua_getfield(L, -1, "_events");
+
+        // Get the event handlers for this event
+        lua_getfield(L, -1, EventName);
+
+        if (lua_istable(L, -1))
+        {
+            // Get the number of arguments (minus event name)
+            int NumArgs = lua_gettop(L) - 4;
+
+            // For each handler, call it with the arguments
+            int TableLen = (int)lua_rawlen(L, -1);
+            for (int i = 1; i <= TableLen; i++)
+            {
+                lua_rawgeti(L, -1, i);
+
+                if (lua_isfunction(L, -1))
+                {
+                    // Push the arguments
+                    for (int arg = 2; arg <= NumArgs + 1; arg++)
+                    {
+                        lua_pushvalue(L, arg);
+                    }
+
+                    // Call the function
+                    lua_call(L, NumArgs, 0);
+                }
+                else
+                {
+                    lua_pop(L, 1);
+                }
+            }
+        }
+
+        // Cleanup
+        lua_pop(L, 4);
+
+        return 0;
+        });
+    lua_setfield(L, -2, "Trigger");
+
+    // Add register function
+    lua_pushcfunction(L, [](lua_State* L) {
+        const char* EventName = luaL_checkstring(L, 1);
+        luaL_checktype(L, 2, LUA_TFUNCTION);
+
+        // Get the events table
+        lua_getglobal(L, "UE");
+        lua_getfield(L, -1, "Event");
+        lua_getfield(L, -1, "_events");
+
+        // Get or create the table for this event
+        lua_getfield(L, -1, EventName);
+        if (lua_isnil(L, -1))
+        {
+            lua_pop(L, 1);
+            lua_newtable(L);
+            lua_pushvalue(L, -1);
+            lua_setfield(L, -3, EventName);
+        }
+
+        // Add the function to the event table
+        int TableLen = (int)lua_rawlen(L, -1) + 1;
+        lua_pushvalue(L, 2);
+        lua_rawseti(L, -2, TableLen);
+
+        // Cleanup
+        lua_pop(L, 4);
+
+        return 0;
+        });
+    lua_setfield(L, -2, "Register");
+
+    // Add unregister function
+    lua_pushcfunction(L, [](lua_State* L) {
+        const char* EventName = luaL_checkstring(L, 1);
+
+        // Get the events table
+        lua_getglobal(L, "UE");
+        lua_getfield(L, -1, "Event");
+        lua_getfield(L, -1, "_events");
+
+        // Clear the event table for this event
+        lua_pushnil(L);
+        lua_setfield(L, -2, EventName);
+
+        // Cleanup
+        lua_pop(L, 3);
+
+        return 0;
+        });
+    lua_setfield(L, -2, "Unregister");
+
+    // Set the Event table in the UE namespace
+    lua_setfield(L, -2, "Event");
+
+    // Pop the UE table
+    lua_pop(L, 1);
 }
