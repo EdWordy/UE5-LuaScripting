@@ -1,6 +1,6 @@
 # Lua Scripting API for Unreal Engine
 
-This document provides a complete reference for the Lua scripting API available in your Unreal Engine project.
+This document provides a complete reference for the Lua Scripting API available to your Unreal Engine project.
 
 ## Table of Contents
 - [Overview](#overview)
@@ -110,7 +110,6 @@ local rotation = {
 2. **Avoid excessive object spawning**: Spawning objects is expensive - reuse or pool them when possible
 3. **Clean up after yourself**: Make sure to unregister events when you're done with them
 4. **Use the global storage wisely**: Use `_G` for storing persistent data, but be careful of name conflicts
-5. **Keep scripts modular**: Split large scripts into multiple logical components
 
 ## Examples
 
